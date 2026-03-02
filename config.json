@@ -1,0 +1,33 @@
+{
+  "_comment": "OSINT Auto Scanner — Configuration File",
+  "_instructions": "Edit the values below to customize the scanner. Do NOT remove any keys.",
+  "your_email": "your_email_here@example.com",
+  "source_file": "valid_sources.txt",
+  "timeout_seconds": 20,
+  "max_workers": 10,
+  "_dead_feed_note": "A feed is flagged as dead after this many consecutive scan failures. The Dead Feed Manager will appear automatically after a scan if any dead feeds are still in your sources list.",
+  "dead_feed_threshold": 3,
+  "high_priority_terms": [
+
+  ],
+  "tld_map": {
+    ".fr": "France",
+    ".in": "India",
+    ".uk": "United Kingdom",
+    ".jp": "Japan",
+    ".cn": "China",
+    ".ru": "Russia",
+    ".de": "Germany",
+    ".au": "Australia",
+    ".ca": "Canada",
+    ".br": "Brazil",
+    ".sg": "Singapore",
+    ".hk": "Hong Kong",
+    ".it": "Italy",
+    ".es": "Spain",
+    ".nl": "Netherlands",
+    ".ch": "Switzerland",
+    ".gov": "USA",
+    ".mil": "USA"
+  }
+}
