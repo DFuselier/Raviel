@@ -6,6 +6,7 @@ import os
 import sys
 import ssl
 import json
+import csv
 import socket
 import urllib.request
 import urllib.error
@@ -19,22 +20,21 @@ from datetime import datetime, timedelta, timezone
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION LOADER
-# Reads settings from config.json sitting next to this script.
-# If the file is missing or a key is absent, safe defaults are used so the
-# tool still runs — but you should fix config.json when you get a chance.
 # ---------------------------------------------------------------------------
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 HEALTH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feed_health.json")
 
 _DEFAULTS = {
-    "your_email":          "nbawysvcrgjhmgbgcc@nesopf.com",
+    "your_email":          "anonymous@example.com",
     "source_file":         "valid_sources.txt",
     "timeout_seconds":     20,
     "max_workers":         10,
     "dead_feed_threshold": 3,
     "high_priority_terms": [
-
+        "Node.js", "Jenkins", "ESXi", "Ivanti", "Tenable", "Shiny",
+        "Coupa", "Workday", "Salesforce", "Deal Cloud", "Hazeltree", "Drupal",
+        "RDP", "RMM", "Remote Management", "Remote Monitoring", "IOC", "Cisco"
     ],
     "tld_map": {
         ".fr": "France", ".in": "India", ".uk": "United Kingdom", ".jp": "Japan",
@@ -91,8 +91,6 @@ IOC_REGEX = {
     'suspicious_files': re.compile(r'\.(exe|dll|bat|sh|ps1|apk|jar|elf)\b', re.IGNORECASE),
 }
 
-# Hash patterns alone match too many innocent hex strings (UUIDs, CSS colours, etc.).
-# Only flag them when these context words appear nearby.
 IOC_CONTEXT_WORDS = re.compile(
     r'\b(malware|hash|ioc|indicator|sha|md5|trojan|ransomware|exploit|'
     r'payload|backdoor|c2|command.and.control|threat|sample|dropper)\b',
@@ -126,8 +124,6 @@ socket.setdefaulttimeout(TIMEOUT_SECONDS)
 
 # ---------------------------------------------------------------------------
 # FEED HEALTH DATABASE
-# Persists per-URL statistics across scans in feed_health.json.
-# All writes happen at scan-end on the main thread, so no locking is needed.
 # ---------------------------------------------------------------------------
 
 def _now_str():
@@ -135,16 +131,28 @@ def _now_str():
     return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
 
+# Staleness thresholds: (max_days_or_None, label, emoji, tag_name, hex_colour)
+# The emoji prefix is embedded in the 'Last Published' column string so it is
+# visible without needing per-cell background colours (Treeview does not support
+# per-cell colouring natively).
+_STALENESS_BANDS = [
+    (30,   'Fresh',   '🟢', 'stale_fresh',   '#d4edda'),  # < 30 days
+    (90,   'Aging',   '🟡', 'stale_aging',   '#fff3cd'),  # 30-90 days
+    (180,  'Stale',   '🟠', 'stale_stale',   '#fde8cc'),  # 90-180 days
+    (365,  'Old',     '🔴', 'stale_old',     '#f8d7da'),  # 180-365 days
+    (None, 'Dormant', '⬛', 'stale_dormant', '#e2e3e5'),  # 365+ days
+]
+
+
 class FeedHealthDB:
     """Tracks per-feed health statistics and persists them to feed_health.json."""
 
-    # Row background colours used by the health dashboard treeview.
     STATUS_COLOURS = {
-        'Good':     '#d4edda',  # soft green
-        'Unstable': '#fff3cd',  # amber
-        'Poor':     '#f8d7da',  # red-pink
-        'Dead':     '#e2e3e5',  # grey
-        'New':      '#cce5ff',  # blue
+        'Good':     '#d4edda',
+        'Unstable': '#fff3cd',
+        'Poor':     '#f8d7da',
+        'Dead':     '#e2e3e5',
+        'New':      '#cce5ff',
         'Unknown':  '#ffffff',
     }
 
@@ -173,8 +181,18 @@ class FeedHealthDB:
 
     # --- Recording scan outcomes ---
 
-    def record_success(self, url, category, article_count):
-        """Record a successful fetch (even if 0 articles fell within the time window)."""
+    def record_success(self, url, category, article_count, newest_article_date=None):
+        """Record a successful fetch.
+
+        Args:
+            url:                  Feed URL.
+            category:             Category from valid_sources.txt.
+            article_count:        Articles found inside the scan time window.
+            newest_article_date:  ISO date string (YYYY-MM-DD) of the most
+                                  recently published article in the entire feed,
+                                  regardless of the scan window.  Used for
+                                  staleness tracking.
+        """
         entry = self._get_or_create(url, category)
         entry['category']             = category
         entry['total_scans']         += 1
@@ -182,6 +200,13 @@ class FeedHealthDB:
         entry['total_articles']      += article_count
         entry['consecutive_failures'] = 0
         entry['last_success']         = _now_str()
+
+        # Only update if we have a newer date.
+        if newest_article_date:
+            existing = entry.get('last_article_date')
+            if not existing or newest_article_date > existing:
+                entry['last_article_date'] = newest_article_date
+
         self.data[url] = entry
 
     def record_failure(self, url, category, error_msg):
@@ -194,23 +219,22 @@ class FeedHealthDB:
         entry['last_error_msg']       = str(error_msg)[:300]
         self.data[url] = entry
 
-    # --- Querying ---
+    # --- Querying: health status ---
 
     def get_dead_feeds(self, threshold):
-        """Return {url: entry} for feeds at or above the consecutive-failure threshold."""
+        """Return {url: entry} for feeds at or above the failure threshold."""
         return {
             url: entry for url, entry in self.data.items()
             if entry.get('consecutive_failures', 0) >= threshold
         }
 
     def get_status(self, url):
-        """Return a human-readable status label for a URL."""
+        """Return a human-readable health status label for a URL."""
         if url not in self.data:
             return 'Unknown'
         entry = self.data[url]
         cf    = entry.get('consecutive_failures', 0)
         total = entry.get('total_scans', 0)
-
         if cf >= DEAD_FEED_THRESHOLD:
             return 'Dead'
         if cf > 0:
@@ -239,6 +263,122 @@ class FeedHealthDB:
             return '0'
         return str(round(e.get('total_articles', 0) / s, 1))
 
+    # --- Querying: staleness ---
+
+    def get_staleness_info(self, url):
+        """Return (label, emoji, tag_name, hex_colour) for this feed's last_article_date.
+
+        Staleness bands:
+          🟢 Fresh   < 30 days
+          🟡 Aging   30-90 days
+          🟠 Stale   90-180 days
+          🔴 Old     180-365 days
+          ⬛ Dormant 365+ days
+          —  Unknown no date recorded yet
+        """
+        if url not in self.data:
+            return ('Unknown', '—', 'stale_unknown', '#ffffff')
+
+        date_str = self.data[url].get('last_article_date')
+        if not date_str:
+            return ('Unknown', '—', 'stale_unknown', '#ffffff')
+
+        try:
+            last_dt = datetime.fromisoformat(date_str)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return ('Unknown', '—', 'stale_unknown', '#ffffff')
+
+        age_days = (datetime.now(timezone.utc) - last_dt).days
+
+        for threshold, label, emoji, tag, colour in _STALENESS_BANDS:
+            if threshold is None or age_days < threshold:
+                return (label, emoji, tag, colour)
+
+        return ('Dormant', '⬛', 'stale_dormant', '#e2e3e5')
+
+    def get_staleness_col_str(self, url):
+        """Return the formatted string for the 'Last Published' column.
+
+        Format: '<emoji> YYYY-MM-DD'  or  '— Never seen'
+        """
+        if url not in self.data:
+            return '— Never seen'
+        date_str = self.data[url].get('last_article_date')
+        if not date_str:
+            return '— Never seen'
+        _, emoji, _, _ = self.get_staleness_info(url)
+        return f"{emoji} {date_str[:10]}"
+
+    # --- Querying: notes ---
+
+    def get_note(self, url):
+        """Return the user annotation for a feed, or empty string if none."""
+        if url not in self.data:
+            return ''
+        return self.data[url].get('note', '')
+
+    def set_note(self, url, text):
+        """Set the user annotation for a feed.  Call save() afterwards to persist."""
+        if url in self.data:
+            self.data[url]['note'] = str(text).strip()
+
+    # --- Category aggregation ---
+
+    def get_category_summary(self):
+        """Return a list of per-category aggregate dicts sorted by category name.
+
+        Each dict keys: category, total_feeds, good, unstable, poor, dead,
+        new_feeds, avg_success_rate, freshest_date, stalest_date.
+        """
+        cats = {}
+        for url, entry in self.data.items():
+            cat    = entry.get('category', 'Uncategorized')
+            status = self.get_status(url)
+            if cat not in cats:
+                cats[cat] = {
+                    'category':       cat,
+                    'total_feeds':    0,
+                    'good':           0,
+                    'unstable':       0,
+                    'poor':           0,
+                    'dead':           0,
+                    'new_feeds':      0,
+                    '_success_rates': [],
+                    '_article_dates': [],
+                }
+            c = cats[cat]
+            c['total_feeds'] += 1
+            key_map = {'good': 'good', 'unstable': 'unstable', 'poor': 'poor',
+                       'dead': 'dead', 'new': 'new_feeds'}
+            sk = status.lower()
+            if sk in key_map:
+                c[key_map[sk]] += 1
+
+            total = entry.get('total_scans', 0)
+            if total > 0:
+                c['_success_rates'].append(entry.get('total_successes', 0) / total)
+
+            d = entry.get('last_article_date')
+            if d:
+                c['_article_dates'].append(d)
+
+        result = []
+        for c in cats.values():
+            rates = c.pop('_success_rates')
+            dates = c.pop('_article_dates')
+            c['avg_success_rate'] = (
+                f"{round(sum(rates) / len(rates) * 100)}%" if rates else '—'
+            )
+            c['freshest_date'] = max(dates)[:10] if dates else '—'
+            c['stalest_date']  = min(dates)[:10] if dates else '—'
+            result.append(c)
+
+        return sorted(result, key=lambda x: x['category'].lower())
+
+    # --- Misc ---
+
     def remove_urls(self, urls_to_remove):
         """Delete entries for the given URLs from the in-memory DB."""
         for url in urls_to_remove:
@@ -254,9 +394,11 @@ class FeedHealthDB:
                 'total_scans':          0,
                 'total_successes':      0,
                 'total_articles':       0,
+                'last_article_date':    None,   # ISO date of newest article ever seen
                 'last_success':         None,
                 'last_error':           None,
                 'last_error_msg':       None,
+                'note':                 '',     # free-text user annotation
                 'first_seen':           _now_str(),
             }
         return self.data[url]
@@ -267,11 +409,7 @@ class FeedHealthDB:
 # ---------------------------------------------------------------------------
 
 def get_cutoff_time():
-    """Return (cutoff_datetime, mode_label) based on the current day of week.
-
-    On Mondays the lookback window is 72 hours to cover the weekend.
-    All other days it is 24 hours.
-    """
+    """Return (cutoff_datetime, mode_label) based on the current day of week."""
     now = datetime.now(timezone.utc)
     if now.weekday() == 0:
         return now - timedelta(hours=72), "Weekend Mode (72h)"
@@ -293,11 +431,7 @@ def get_country_from_url(url):
 
 
 def parse_date_smart(date_obj_or_str):
-    """Parse a date from various formats into a timezone-aware datetime object.
-
-    Accepts feedparser time tuples, email-format strings, and common
-    ISO / RFC date strings.  Returns None if the input cannot be parsed.
-    """
+    """Parse a date from various formats into a timezone-aware datetime object."""
     if not date_obj_or_str:
         return None
 
@@ -337,15 +471,7 @@ def strip_html(text):
 
 
 def check_for_iocs(text):
-    """Scan text for Indicators of Compromise (IOCs).
-
-    IP addresses, CVEs, emails, and suspicious file extensions are flagged
-    directly.  Hash patterns (MD5/SHA) are only flagged when IOC-related
-    context words are also present, reducing false positives from random
-    hex strings in article URLs and identifiers.
-
-    Returns True if any IOC is detected, False otherwise.
-    """
+    """Scan text for Indicators of Compromise (IOCs)."""
     if not text:
         return False
     for key in ('ipv4', 'email', 'cve', 'suspicious_files'):
@@ -361,8 +487,8 @@ def check_for_iocs(text):
 def fetch_feed_content(url):
     """Fetch raw feed bytes from a URL.
 
-    Returns bytes on success, or b"ERROR: ..." for handled HTTP errors (403).
-    Raises for all other network / HTTP errors.
+    Returns bytes on success, or b"ERROR: ..." for 403.
+    Raises for all other errors.
     """
     ssl_context = ssl.create_default_context()
     headers = {'User-Agent': SEC_USER_AGENT} if "sec.gov" in url else STANDARD_HEADERS
@@ -376,7 +502,7 @@ def fetch_feed_content(url):
                 try:
                     content = gzip.decompress(content)
                 except gzip.BadGzipFile:
-                    pass  # Header lied; content was not actually gzip — use as-is.
+                    pass
                 except OSError as e:
                     raise RuntimeError(f"Gzip decompression failed: {e}") from e
 
@@ -392,21 +518,13 @@ def fetch_feed_content(url):
 
 
 def process_single_feed(source_data, cutoff):
-    """Fetch and parse one RSS/Atom feed, filtering entries newer than cutoff.
+    """Fetch and parse one RSS/Atom feed.
 
-    Args:
-        source_data: A (category, url) tuple from the source list.
-        cutoff:      Timezone-aware datetime; only entries published after
-                     this time are included.
+    Returns (category, findings_or_None, error_or_None).
 
-    Returns:
-        (category, findings_or_None, error_or_None)
-
-        On success, findings always contains an 'article_count' key reflecting
-        the raw number of recent entries before deduplication — used by the
-        health DB to record meaningful yield numbers.
-        On any failure, findings is None and error is a dict with 'url',
-        'category', and 'error' keys.
+    findings includes 'newest_article_date' — the ISO date of the most recently
+    published entry across the ENTIRE feed (not just within the cutoff window).
+    This allows staleness tracking even on scans where no articles are new.
     """
     category, url = source_data
 
@@ -420,8 +538,9 @@ def process_single_feed(source_data, cutoff):
         if feed.bozo and not feed.entries:
             return (category, None, {'url': url, 'category': category, 'error': "Invalid Feed Data"})
 
-        site_title  = feed.feed.get('title', url[:30] + "...")
-        site_buffer = []
+        site_title      = feed.feed.get('title', url[:30] + "...")
+        site_buffer     = []
+        newest_pub_date = None   # tracks newest date across ALL entries in feed
 
         for entry in feed.entries:
             pub_date = None
@@ -438,6 +557,12 @@ def process_single_feed(source_data, cutoff):
                         if pub_date:
                             break
 
+            # Update newest across the whole feed regardless of cutoff
+            if pub_date:
+                if newest_pub_date is None or pub_date > newest_pub_date:
+                    newest_pub_date = pub_date
+
+            # Only collect articles within the scan window for the report
             if pub_date and pub_date > cutoff:
                 title       = entry.get('title', 'No Title')
                 link        = entry.get('link', url)
@@ -452,14 +577,15 @@ def process_single_feed(source_data, cutoff):
                     'has_ioc':        check_for_iocs(scan_text),
                 })
 
-        # Always return a findings dict on success so we can record article_count = 0
-        # for alive feeds that simply had no recent articles in the time window.
+        newest_article_date = newest_pub_date.strftime('%Y-%m-%d') if newest_pub_date else None
+
         findings = {
-            'site_title':    site_title,
-            'url':           url,
-            'country':       get_country_from_url(url),
-            'articles':      site_buffer,
-            'article_count': len(site_buffer),
+            'site_title':          site_title,
+            'url':                 url,
+            'country':             get_country_from_url(url),
+            'articles':            site_buffer,
+            'article_count':       len(site_buffer),
+            'newest_article_date': newest_article_date,
         }
 
     except Exception as e:
@@ -520,13 +646,13 @@ class OSINTApp:
         control_frame = ttk.Frame(self.root, padding="10")
         control_frame.pack(fill=tk.X)
 
-        self.btn_scan   = ttk.Button(control_frame, text="START SCAN",    command=self.start_scan_thread)
+        self.btn_scan   = ttk.Button(control_frame, text="START SCAN",   command=self.start_scan_thread)
         self.btn_scan.pack(side=tk.LEFT, padx=5)
 
-        self.btn_edit   = ttk.Button(control_frame, text="EDIT SOURCES",  command=self.open_source_editor)
+        self.btn_edit   = ttk.Button(control_frame, text="EDIT SOURCES", command=self.open_source_editor)
         self.btn_edit.pack(side=tk.LEFT, padx=5)
 
-        self.btn_health = ttk.Button(control_frame, text="FEED HEALTH",   command=self.open_feed_health_window)
+        self.btn_health = ttk.Button(control_frame, text="FEED HEALTH",  command=self.open_feed_health_window)
         self.btn_health.pack(side=tk.LEFT, padx=5)
 
         self.lbl_status = ttk.Label(control_frame, text="Ready", font=("Arial", 10, "bold"))
@@ -557,14 +683,14 @@ class OSINTApp:
         self.log_area.bind("<Button-3>", self.show_context_menu)
 
     # ------------------------------------------------------------------
-    # FEED HEALTH DASHBOARD
+    # FEED HEALTH DASHBOARD  (tabbed: By Feed | By Category)
     # ------------------------------------------------------------------
 
     def open_feed_health_window(self):
-        """Open a sortable dashboard showing per-feed health statistics."""
+        """Open the Feed Health Dashboard with By-Feed and By-Category tabs."""
         win = tk.Toplevel(self.root)
         win.title("Feed Health Dashboard")
-        win.geometry("1100x600")
+        win.geometry("1200x650")
         win.resizable(True, True)
 
         # --- Summary bar ---
@@ -591,17 +717,46 @@ class OSINTApp:
 
         ttk.Button(summary_frame, text="Manage Dead Feeds",
                    command=self.open_dead_feed_manager).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(summary_frame, text="↻ Refresh",
-                   command=lambda: self._refresh_health_tree(tree)).pack(side=tk.RIGHT, padx=5)
 
         ttk.Separator(win, orient='horizontal').pack(fill=tk.X, padx=10)
 
-        # --- Treeview ---
-        cols = ('status', 'url', 'category', 'success_rate', 'avg_articles',
-                'consec_fails', 'last_success', 'last_error')
+        # --- Notebook ---
+        notebook = ttk.Notebook(win)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
 
-        tree_frame = ttk.Frame(win)
-        tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        feed_tab = ttk.Frame(notebook)
+        cat_tab  = ttk.Frame(notebook)
+        notebook.add(feed_tab, text="  By Feed  ")
+        notebook.add(cat_tab,  text="  By Category  ")
+
+        feed_tree = self._build_feed_tab(feed_tab, win)
+        self._build_category_tab(cat_tab)
+
+        # --- Bottom toolbar ---
+        toolbar = ttk.Frame(win, padding="8 4")
+        toolbar.pack(fill=tk.X)
+
+        ttk.Button(toolbar, text="↻ Refresh",
+                   command=lambda: self._refresh_health_tree(feed_tree)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="Export to CSV",
+                   command=lambda: self._export_health_csv(win)).pack(side=tk.LEFT, padx=4)
+        ttk.Label(
+            toolbar,
+            text="By Feed: double-click = copy URL  |  right-click = edit note  |  click header = sort",
+            font=("Arial", 8), foreground="gray",
+        ).pack(side=tk.LEFT, padx=12)
+
+    # ------------------------------------------------------------------
+    # By-Feed tab
+    # ------------------------------------------------------------------
+
+    def _build_feed_tab(self, parent, win):
+        """Build the per-feed treeview.  Returns the tree widget."""
+        cols = ('status', 'url', 'category', 'success_rate', 'avg_articles',
+                'consec_fails', 'last_published', 'last_success', 'last_error', 'note')
+
+        tree_frame = ttk.Frame(parent)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
 
         scroll_y = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
         scroll_x = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL)
@@ -621,87 +776,283 @@ class OSINTApp:
         tree.pack(fill=tk.BOTH, expand=True)
 
         headings = {
-            'status':       ('Status',         90, tk.CENTER),
-            'url':          ('Feed URL',       340, tk.W),
-            'category':     ('Category',       120, tk.W),
-            'success_rate': ('Success Rate',    90, tk.CENTER),
-            'avg_articles': ('Avg Articles',    90, tk.CENTER),
-            'consec_fails': ('Consec. Fails',   90, tk.CENTER),
-            'last_success': ('Last Success',   150, tk.CENTER),
-            'last_error':   ('Last Error',     150, tk.CENTER),
+            'status':         ('Status',         90, tk.CENTER),
+            'url':            ('Feed URL',       300, tk.W),
+            'category':       ('Category',       110, tk.W),
+            'success_rate':   ('Success Rate',    85, tk.CENTER),
+            'avg_articles':   ('Avg Articles',    85, tk.CENTER),
+            'consec_fails':   ('Consec. Fails',   85, tk.CENTER),
+            'last_published': ('Last Published', 130, tk.CENTER),
+            'last_success':   ('Last Success',   140, tk.CENTER),
+            'last_error':     ('Last Error',     140, tk.CENTER),
+            'note':           ('Note',           180, tk.W),
         }
         for col, (label, width, anchor) in headings.items():
             tree.heading(col, text=label,
                          command=lambda c=col: self._sort_health_tree(tree, c, False))
-            tree.column(col, width=width, anchor=anchor, minwidth=60)
+            tree.column(col, width=width, anchor=anchor, minwidth=50)
 
-        # Row background colours by status
+        # Health status row colours (row-level tags)
         for status, bg in FeedHealthDB.STATUS_COLOURS.items():
             tree.tag_configure(status.lower(), background=bg)
 
         self._refresh_health_tree(tree)
 
-        ttk.Label(win,
-                  text="Click a column header to sort.  Double-click a row to copy the URL.",
-                  font=("Arial", 8), foreground="gray").pack(pady=(0, 6))
+        # --- Interactions ---
 
         def on_double_click(event):
             item = tree.focus()
-            if item:
-                url_val = tree.item(item, 'values')[1]
-                self.root.clipboard_clear()
-                self.root.clipboard_append(url_val)
-                self.root.update()
-                win.title("Feed Health Dashboard  —  URL copied!")
-                win.after(1800, lambda: win.title("Feed Health Dashboard"))
+            if not item:
+                return
+            url_val = tree.item(item, 'values')[1]
+            self.root.clipboard_clear()
+            self.root.clipboard_append(url_val)
+            self.root.update()
+            win.title("Feed Health Dashboard  —  URL copied!")
+            win.after(1800, lambda: win.title("Feed Health Dashboard"))
+
+        def on_right_click(event):
+            row = tree.identify_row(event.y)
+            if not row:
+                return
+            tree.selection_set(row)
+            tree.focus(row)
+            ctx = tk.Menu(tree, tearoff=0)
+            ctx.add_command(label="Edit Note...",
+                            command=lambda: self._open_note_editor(tree, row))
+            ctx.add_command(label="Copy URL",
+                            command=lambda: self._copy_url_from_row(tree, row, win))
+            try:
+                ctx.tk_popup(event.x_root, event.y_root)
+            finally:
+                ctx.grab_release()
 
         tree.bind("<Double-1>", on_double_click)
+        tree.bind("<Button-3>", on_right_click)
+
+        return tree
 
     def _refresh_health_tree(self, tree):
-        """Clear and repopulate the health treeview from the current DB."""
+        """Clear and repopulate the By-Feed treeview from the current DB."""
         for row in tree.get_children():
             tree.delete(row)
+
         for url, entry in self.health_db.data.items():
-            status = self.health_db.get_status(url)
-            tree.insert('', tk.END, values=(
+            status       = self.health_db.get_status(url)
+            note         = entry.get('note', '')
+            note_display = (note[:35] + '…') if len(note) > 35 else note
+
+            tree.insert('', tk.END, iid=url, values=(
                 status,
                 url,
                 entry.get('category', '—'),
                 self.health_db.get_success_rate_str(url),
                 self.health_db.get_avg_articles_str(url),
                 entry.get('consecutive_failures', 0),
+                self.health_db.get_staleness_col_str(url),
                 entry.get('last_success') or '—',
                 entry.get('last_error')   or '—',
+                note_display,
             ), tags=(status.lower(),))
 
     def _sort_health_tree(self, tree, col, reverse):
-        """Sort the health treeview rows by the given column."""
+        """Sort the By-Feed treeview rows by the given column."""
         rows = [(tree.set(child, col), child) for child in tree.get_children('')]
         try:
-            rows.sort(key=lambda x: float(x[0]) if x[0] not in ('—', '') else -1.0,
-                      reverse=reverse)
+            rows.sort(
+                key=lambda x: float(x[0]) if x[0] not in ('—', '', '— Never seen') else -1.0,
+                reverse=reverse,
+            )
         except ValueError:
             rows.sort(key=lambda x: x[0].lower(), reverse=reverse)
         for index, (_, child) in enumerate(rows):
             tree.move(child, '', index)
         tree.heading(col, command=lambda: self._sort_health_tree(tree, col, not reverse))
 
+    def _open_note_editor(self, tree, iid):
+        """Open a dialog to edit the annotation for a feed (iid == URL)."""
+        url      = iid
+        existing = self.health_db.get_note(url)
+
+        new_note = simpledialog.askstring(
+            "Edit Note",
+            f"Note for:\n{url[:80]}\n",
+            initialvalue=existing,
+            parent=self.root,
+        )
+        if new_note is None:
+            return   # user cancelled
+
+        self.health_db.set_note(url, new_note)
+        self.health_db.save()
+
+        # Update the treeview row immediately without a full refresh
+        display = (new_note[:35] + '…') if len(new_note) > 35 else new_note
+        vals    = list(tree.item(iid, 'values'))
+        vals[9] = display   # 'note' is column index 9
+        tree.item(iid, values=vals)
+
+    def _copy_url_from_row(self, tree, iid, win):
+        """Copy the URL from a treeview row to the clipboard."""
+        url_val = tree.item(iid, 'values')[1]
+        self.root.clipboard_clear()
+        self.root.clipboard_append(url_val)
+        self.root.update()
+        win.title("Feed Health Dashboard  —  URL copied!")
+        win.after(1800, lambda: win.title("Feed Health Dashboard"))
+
+    # ------------------------------------------------------------------
+    # By-Category tab
+    # ------------------------------------------------------------------
+
+    def _build_category_tab(self, parent):
+        """Build the category-rollup treeview inside the By Category tab."""
+        cols = ('category', 'total', 'good', 'unstable', 'poor', 'dead',
+                'new_feeds', 'avg_success', 'freshest', 'stalest')
+
+        tree_frame = ttk.Frame(parent)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        scroll_y = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
+        tree = ttk.Treeview(
+            tree_frame,
+            columns=cols,
+            show='headings',
+            yscrollcommand=scroll_y.set,
+            selectmode='browse',
+        )
+        scroll_y.config(command=tree.yview)
+        scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.pack(fill=tk.BOTH, expand=True)
+
+        headings = {
+            'category':   ('Category',         200, tk.W),
+            'total':      ('Total Feeds',        90, tk.CENTER),
+            'good':       ('Good',               60, tk.CENTER),
+            'unstable':   ('Unstable',           65, tk.CENTER),
+            'poor':       ('Poor',               60, tk.CENTER),
+            'dead':       ('Dead',               60, tk.CENTER),
+            'new_feeds':  ('New',                60, tk.CENTER),
+            'avg_success':('Avg Success Rate',  120, tk.CENTER),
+            'freshest':   ('Freshest Article',  130, tk.CENTER),
+            'stalest':    ('Stalest Article',   130, tk.CENTER),
+        }
+        for col, (label, width, anchor) in headings.items():
+            tree.heading(col, text=label,
+                         command=lambda c=col: self._sort_cat_tree(tree, c, False))
+            tree.column(col, width=width, anchor=anchor, minwidth=50)
+
+        # Row colours: any dead feeds = pink, any unstable/poor = amber, else green
+        tree.tag_configure('cat_healthy',  background='#d4edda')
+        tree.tag_configure('cat_warning',  background='#fff3cd')
+        tree.tag_configure('cat_critical', background='#f8d7da')
+
+        for row in self.health_db.get_category_summary():
+            if row['dead'] > 0:
+                tag = 'cat_critical'
+            elif row['unstable'] > 0 or row['poor'] > 0:
+                tag = 'cat_warning'
+            else:
+                tag = 'cat_healthy'
+
+            tree.insert('', tk.END, values=(
+                row['category'],
+                row['total_feeds'],
+                row['good'],
+                row['unstable'],
+                row['poor'],
+                row['dead'],
+                row['new_feeds'],
+                row['avg_success_rate'],
+                row['freshest_date'],
+                row['stalest_date'],
+            ), tags=(tag,))
+
+        ttk.Label(
+            parent,
+            text="Row colours: 🟢 all healthy  🟡 some unstable/poor  🔴 has dead feed(s)",
+            font=("Arial", 8), foreground="gray",
+        ).pack(pady=(2, 4))
+
+    def _sort_cat_tree(self, tree, col, reverse):
+        """Sort the By-Category treeview by the given column."""
+        rows = [(tree.set(child, col), child) for child in tree.get_children('')]
+        try:
+            rows.sort(
+                key=lambda x: float(x[0].replace('%', '')) if x[0] not in ('—', '') else -1.0,
+                reverse=reverse,
+            )
+        except ValueError:
+            rows.sort(key=lambda x: x[0].lower(), reverse=reverse)
+        for index, (_, child) in enumerate(rows):
+            tree.move(child, '', index)
+        tree.heading(col, command=lambda: self._sort_cat_tree(tree, col, not reverse))
+
+    # ------------------------------------------------------------------
+    # CSV Export
+    # ------------------------------------------------------------------
+
+    def _export_health_csv(self, parent_win):
+        """Export the full feed health data to a CSV file chosen by the user."""
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
+            title="Export Feed Health to CSV",
+            parent=parent_win,
+        )
+        if not file_path:
+            return
+
+        fieldnames = [
+            'url', 'category', 'status', 'success_rate', 'avg_articles_per_scan',
+            'consecutive_failures', 'total_scans', 'total_successes', 'total_articles',
+            'last_published', 'last_article_date', 'last_success', 'last_error',
+            'last_error_msg', 'first_seen', 'note',
+        ]
+
+        try:
+            with open(file_path, 'w', newline='', encoding='utf-8-sig') as fh:
+                writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction='ignore')
+                writer.writeheader()
+
+                for url, entry in self.health_db.data.items():
+                    total = entry.get('total_scans', 0)
+                    succ  = entry.get('total_successes', 0)
+                    arts  = entry.get('total_articles', 0)
+                    writer.writerow({
+                        'url':                   url,
+                        'category':              entry.get('category', ''),
+                        'status':                self.health_db.get_status(url),
+                        'success_rate':          f"{succ}/{total}" if total else '0/0',
+                        'avg_articles_per_scan': round(arts / succ, 1) if succ else 0,
+                        'consecutive_failures':  entry.get('consecutive_failures', 0),
+                        'total_scans':           total,
+                        'total_successes':       succ,
+                        'total_articles':        arts,
+                        'last_published':        self.health_db.get_staleness_col_str(url),
+                        'last_article_date':     entry.get('last_article_date') or '',
+                        'last_success':          entry.get('last_success')      or '',
+                        'last_error':            entry.get('last_error')        or '',
+                        'last_error_msg':        entry.get('last_error_msg')    or '',
+                        'first_seen':            entry.get('first_seen')        or '',
+                        'note':                  entry.get('note', ''),
+                    })
+
+            messagebox.showinfo("Exported",
+                                f"Feed health exported to:\n{file_path}",
+                                parent=parent_win)
+        except OSError as e:
+            messagebox.showerror("Export Failed", f"Could not write CSV:\n{e}",
+                                 parent=parent_win)
+
     # ------------------------------------------------------------------
     # DEAD FEED MANAGER
     # ------------------------------------------------------------------
 
     def open_dead_feed_manager(self, auto_prompt=False):
-        """Open a dialog listing dead feeds with checkboxes to remove them.
-
-        Args:
-            auto_prompt: When True (called automatically after a scan), a more
-                         prominent title is shown.  When False (opened from the
-                         menu/button), an info dialog is shown if no dead feeds
-                         exist yet.
-        """
+        """Open a dialog listing dead feeds with checkboxes to remove them."""
         dead = self.health_db.get_dead_feeds(DEAD_FEED_THRESHOLD)
 
-        # Only show feeds that are still present in valid_sources.txt.
         active_urls = set()
         if os.path.exists(SOURCE_FILE):
             with open(SOURCE_FILE, 'r', encoding='utf-8') as fh:
@@ -732,7 +1083,6 @@ class OSINTApp:
         win.resizable(True, True)
         win.grab_set()
 
-        # --- Header ---
         hdr = ttk.Frame(win, padding="12 10 12 4")
         hdr.pack(fill=tk.X)
         ttk.Label(
@@ -749,13 +1099,12 @@ class OSINTApp:
         ).pack(anchor='w', pady=(2, 0))
         ttk.Separator(win, orient='horizontal').pack(fill=tk.X, padx=10, pady=4)
 
-        # --- Scrollable checklist ---
         container = ttk.Frame(win)
         container.pack(fill=tk.BOTH, expand=True, padx=10)
 
-        canvas      = tk.Canvas(container, borderwidth=0, background="#f9f9f9")
-        vscroll     = ttk.Scrollbar(container, orient=tk.VERTICAL, command=canvas.yview)
-        inner       = ttk.Frame(canvas, padding="4")
+        canvas  = tk.Canvas(container, borderwidth=0, background="#f9f9f9")
+        vscroll = ttk.Scrollbar(container, orient=tk.VERTICAL, command=canvas.yview)
+        inner   = ttk.Frame(canvas, padding="4")
         inner.bind("<Configure>",
                    lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.create_window((0, 0), window=inner, anchor='nw')
@@ -763,18 +1112,15 @@ class OSINTApp:
         vscroll.pack(side=tk.RIGHT, fill=tk.Y)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Column labels
         col_hdr = ttk.Frame(inner)
         col_hdr.pack(fill=tk.X, pady=(0, 3))
         ttk.Label(col_hdr, text="Remove", width=7,  font=("Arial", 9, "bold")).pack(side=tk.LEFT)
         ttk.Label(col_hdr, text="Feed URL",         font=("Arial", 9, "bold"), width=52).pack(side=tk.LEFT)
-        ttk.Label(col_hdr, text="Fails", width=6,  font=("Arial", 9, "bold")).pack(side=tk.LEFT)
+        ttk.Label(col_hdr, text="Fails",  width=6,  font=("Arial", 9, "bold")).pack(side=tk.LEFT)
         ttk.Label(col_hdr, text="Last Error",       font=("Arial", 9, "bold")).pack(side=tk.LEFT)
         ttk.Separator(inner, orient='horizontal').pack(fill=tk.X, pady=2)
 
-        check_vars = {}
-
-        # Sort by most failures first so the worst offenders are at the top.
+        check_vars  = {}
         sorted_dead = sorted(dead_in_sources.items(),
                              key=lambda x: -x[1].get('consecutive_failures', 0))
 
@@ -791,7 +1137,6 @@ class OSINTApp:
             lbl = ttk.Label(row, text=display_url, width=52,
                             font=("Consolas", 9), foreground="#2c3e50")
             lbl.pack(side=tk.LEFT)
-            # Hovering shows the full URL in the window title bar.
             lbl.bind("<Enter>", lambda e, u=url: win.title(u))
             lbl.bind("<Leave>", lambda e: win.title(title))
 
@@ -805,7 +1150,6 @@ class OSINTApp:
 
             ttk.Separator(inner, orient='horizontal').pack(fill=tk.X)
 
-        # --- Action buttons ---
         btn_frame = ttk.Frame(win, padding="10 8")
         btn_frame.pack(fill=tk.X)
 
@@ -824,50 +1168,35 @@ class OSINTApp:
                                        "No feeds are checked. Tick at least one to remove.",
                                        parent=win)
                 return
-
             preview = "\n".join(f"  • {u[:75]}" for u in to_remove[:8])
             if len(to_remove) > 8:
                 preview += f"\n  ... and {len(to_remove) - 8} more"
-
             if not messagebox.askyesno(
                 "Confirm Removal",
                 f"Remove {len(to_remove)} feed(s) from {SOURCE_FILE}?\n\n{preview}",
                 parent=win,
             ):
                 return
-
             removed, not_found = self._remove_urls_from_sources(to_remove)
             self.health_db.remove_urls(removed)
             self.health_db.save()
-
             summary = f"Removed {len(removed)} feed(s) from {SOURCE_FILE}."
             if not_found:
-                summary += (f"\n\n{len(not_found)} URL(s) were not found in the file "
-                            f"(possibly already removed).")
+                summary += f"\n\n{len(not_found)} URL(s) were not found (possibly already removed)."
             messagebox.showinfo("Done", summary, parent=win)
             win.destroy()
 
-        ttk.Button(btn_frame, text="Select All",   command=select_all).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_frame, text="Deselect All", command=deselect_all).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_frame, text="Remove Selected",
-                   command=remove_selected).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(btn_frame, text="Keep All / Close",
-                   command=win.destroy).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btn_frame, text="Select All",       command=select_all).pack(side=tk.LEFT,  padx=4)
+        ttk.Button(btn_frame, text="Deselect All",     command=deselect_all).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Remove Selected",  command=remove_selected).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btn_frame, text="Keep All / Close", command=win.destroy).pack(side=tk.RIGHT, padx=4)
 
     def _remove_urls_from_sources(self, urls_to_remove):
-        """Remove specific URLs from valid_sources.txt.
-
-        Reads the file line-by-line and writes back every line whose stripped
-        content is NOT in urls_to_remove.
-
-        Returns:
-            (removed_list, not_found_list)
-        """
+        """Remove specific URLs from valid_sources.txt.  Returns (removed, not_found)."""
         remove_set = set(urls_to_remove)
         removed    = []
         not_found  = list(remove_set)
         new_lines  = []
-
         try:
             with open(SOURCE_FILE, 'r', encoding='utf-8') as fh:
                 for line in fh:
@@ -877,14 +1206,11 @@ class OSINTApp:
                         not_found = [u for u in not_found if u != stripped]
                     else:
                         new_lines.append(line)
-
             with open(SOURCE_FILE, 'w', encoding='utf-8') as fh:
                 fh.writelines(new_lines)
-
         except OSError as e:
             messagebox.showerror("File Error", f"Could not modify {SOURCE_FILE}:\n{e}")
             return [], urls_to_remove
-
         return removed, not_found
 
     # ------------------------------------------------------------------
@@ -903,7 +1229,6 @@ class OSINTApp:
             selected_text = self.log_area.get(tk.SEL_FIRST, tk.SEL_LAST)
             self.root.clipboard_clear()
             self.root.clipboard_append(selected_text)
-            # Sync with OS clipboard before returning to prevent segfault on some platforms.
             self.root.update()
 
     def open_source_editor(self):
@@ -1018,7 +1343,6 @@ class OSINTApp:
     def process_queue(self):
         """Drain the inter-thread message queue and update the GUI.
 
-        Called repeatedly by Tkinter's event loop via root.after().
         This is the ONLY method that touches GUI widgets, keeping all
         widget access on the main thread (Tkinter is not thread-safe).
         """
@@ -1029,13 +1353,11 @@ class OSINTApp:
                 if msg_type == "log":
                     text, tag = data
                     self.log_area.config(state='normal')
-
                     if tag == "HEADER":
                         start_index = self.log_area.index(tk.INSERT)
                         clean_name  = text.strip(" #\n")
                         self.category_indices[clean_name] = start_index
                         self.nav_combo['values'] = list(self.category_indices.keys())
-
                     self.log_area.insert(tk.END, text + "\n", tag)
                     self.log_area.see(tk.END)
                     self.log_area.config(state='disabled')
@@ -1052,8 +1374,6 @@ class OSINTApp:
                     self.btn_edit.config(state='normal')
 
                 elif msg_type == "dead_feeds":
-                    # Buttons are already re-enabled by the preceding "done"
-                    # message, so this opens as a non-blocking prompt.
                     self.open_dead_feed_manager(auto_prompt=True)
 
         except queue.Empty:
@@ -1082,13 +1402,7 @@ class OSINTApp:
         thread.start()
 
     def run_logic(self):
-        """Main scan logic — runs entirely in a background thread.
-
-        Loads sources, fans out feed fetches via a thread pool, records health
-        stats for every feed, deduplicates results, writes the report file, then
-        signals the main thread to re-enable controls.  If any feeds are now
-        flagged as dead, it additionally triggers the dead feed manager dialog.
-        """
+        """Main scan logic — runs entirely in a background thread."""
         if not os.path.exists(SOURCE_FILE):
             self.log(f"[!] Error: Could not find '{SOURCE_FILE}'", "ERROR")
             self.scan_finished()
@@ -1110,7 +1424,6 @@ class OSINTApp:
         total_sources = len(source_list)
         self.log(f"--- Loaded {total_sources} sources ---", "INFO")
 
-        # Calculate the cutoff ONCE so every worker uses the exact same window.
         cutoff, mode = get_cutoff_time()
         self.log(f"--- Mode: {mode} ---", "INFO")
 
@@ -1133,7 +1446,7 @@ class OSINTApp:
                 processed_count += 1
                 self.update_progress(processed_count, total_sources)
 
-                # --- Record health outcome for this feed ---
+                # --- Record health ---
                 if error_data:
                     dead_sites.append(error_data)
                     self.health_db.record_failure(
@@ -1141,13 +1454,16 @@ class OSINTApp:
                         error_data.get('error', 'Unknown error'),
                     )
                 else:
-                    article_count = found_data.get('article_count', 0) if found_data else 0
-                    self.health_db.record_success(orig_url, orig_cat, article_count)
+                    article_count       = found_data.get('article_count', 0) if found_data else 0
+                    newest_article_date = found_data.get('newest_article_date') if found_data else None
+                    self.health_db.record_success(
+                        orig_url, orig_cat, article_count,
+                        newest_article_date=newest_article_date,
+                    )
 
-                # --- Collect and deduplicate article findings ---
+                # --- Deduplicate and collect ---
                 if found_data and found_data.get('articles'):
                     filtered_articles = []
-
                     for article in found_data['articles']:
                         if article['link'] in seen_links:
                             continue
@@ -1171,7 +1487,6 @@ class OSINTApp:
                         found_data['articles'] = filtered_articles
                         category_findings[cat].append(found_data)
 
-        # Save health DB once at the end (not per-feed) for efficiency.
         self.health_db.save()
 
         # --- Write report ---
@@ -1191,7 +1506,6 @@ class OSINTApp:
                     header = "### HIGH PRIORITY ALERTS ###"
                     fh.write(header + "\n\n")
                     self.log(header, "HEADER")
-
                     for item in priority_findings:
                         art       = item['article']
                         terms_str = ", ".join(art['priority_terms'])
@@ -1208,7 +1522,6 @@ class OSINTApp:
                     cat_header = f"### {cat.upper()} ###"
                     fh.write(cat_header + "\n\n")
                     self.log("\n" + cat_header, "HEADER")
-
                     for site in sites:
                         fh.write(f"SOURCE: {site['site_title']}\n")
                         for art in site['articles']:
@@ -1220,7 +1533,6 @@ class OSINTApp:
                             fh.write(art_msg + "\n")
                             self.log(art_msg)
 
-                # Append a failed-feeds section to the report for reference.
                 if dead_sites:
                     fh.write("\n### FAILED FEEDS THIS SCAN ###\n\n")
                     for d in dead_sites:
@@ -1232,7 +1544,6 @@ class OSINTApp:
             if dead_sites:
                 self.log(f"--- {len(dead_sites)} feed(s) failed this scan ---", "ERROR")
 
-            # Log a one-line health summary.
             dead_count = len(self.health_db.get_dead_feeds(DEAD_FEED_THRESHOLD))
             self.log(
                 f"--- Feed Health: {len(self.health_db.data)} tracked, "
@@ -1243,20 +1554,14 @@ class OSINTApp:
         except OSError as e:
             self.log(f"Error writing file: {e}", "ERROR")
 
-        # Signal "done" first so the buttons re-enable, THEN check for dead feeds.
-        # process_queue handles "done" before "dead_feeds" because they're queued in order.
         self.scan_finished()
 
-        # Check if any dead feeds are still present in the source file.
         try:
             if os.path.exists(SOURCE_FILE):
                 with open(SOURCE_FILE, 'r', encoding='utf-8') as fh:
                     source_text = fh.read()
-                dead_still_active = any(
-                    url in source_text
-                    for url in self.health_db.get_dead_feeds(DEAD_FEED_THRESHOLD)
-                )
-                if dead_still_active:
+                if any(url in source_text
+                       for url in self.health_db.get_dead_feeds(DEAD_FEED_THRESHOLD)):
                     self.prompt_dead_feeds()
         except OSError:
             pass
@@ -1270,3 +1575,4 @@ if __name__ == "__main__":
     root = tk.Tk()
     app  = OSINTApp(root)
     root.mainloop()
+    
