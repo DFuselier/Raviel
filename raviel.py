@@ -32,9 +32,7 @@ _DEFAULTS = {
     "max_workers":         10,
     "dead_feed_threshold": 3,
     "high_priority_terms": [
-        "Node.js", "Jenkins", "ESXi", "Ivanti", "Tenable", "Shiny",
-        "Coupa", "Workday", "Salesforce", "Deal Cloud", "Hazeltree", "Drupal",
-        "RDP", "RMM", "Remote Management", "Remote Monitoring", "IOC", "Cisco"
+
     ],
     "tld_map": {
         ".fr": "France", ".in": "India", ".uk": "United Kingdom", ".jp": "Japan",
@@ -136,11 +134,11 @@ def _now_str():
 # visible without needing per-cell background colours (Treeview does not support
 # per-cell colouring natively).
 _STALENESS_BANDS = [
-    (30,   'Fresh',   '🟢', 'stale_fresh',   '#d4edda'),  # < 30 days
-    (90,   'Aging',   '🟡', 'stale_aging',   '#fff3cd'),  # 30-90 days
-    (180,  'Stale',   '🟠', 'stale_stale',   '#fde8cc'),  # 90-180 days
-    (365,  'Old',     '🔴', 'stale_old',     '#f8d7da'),  # 180-365 days
-    (None, 'Dormant', '⬛', 'stale_dormant', '#e2e3e5'),  # 365+ days
+    (30,   'Fresh',   'stale_fresh',   '#d4edda'),  # < 30 days
+    (90,   'Aging',   'stale_aging',   '#fff3cd'),  # 30-90 days
+    (180,  'Stale',   'stale_stale',   '#fde8cc'),  # 90-180 days
+    (365,  'Old',     'stale_old',     '#f8d7da'),  # 180-365 days
+    (None, 'Dormant', 'stale_dormant', '#e2e3e5'),  # 365+ days
 ]
 
 
@@ -266,50 +264,50 @@ class FeedHealthDB:
     # --- Querying: staleness ---
 
     def get_staleness_info(self, url):
-        """Return (label, emoji, tag_name, hex_colour) for this feed's last_article_date.
+        """Return (label, tag_name, hex_colour) for this feed's last_article_date.
 
         Staleness bands:
-          🟢 Fresh   < 30 days
-          🟡 Aging   30-90 days
-          🟠 Stale   90-180 days
-          🔴 Old     180-365 days
-          ⬛ Dormant 365+ days
-          —  Unknown no date recorded yet
+          Fresh   < 30 days
+          Aging   30-90 days
+          Stale   90-180 days
+          Old     180-365 days
+          Dormant 365+ days
+          Unknown no date recorded yet
         """
         if url not in self.data:
-            return ('Unknown', '—', 'stale_unknown', '#ffffff')
+            return ('Unknown', 'stale_unknown', '#ffffff')
 
         date_str = self.data[url].get('last_article_date')
         if not date_str:
-            return ('Unknown', '—', 'stale_unknown', '#ffffff')
+            return ('Unknown', 'stale_unknown', '#ffffff')
 
         try:
             last_dt = datetime.fromisoformat(date_str)
             if last_dt.tzinfo is None:
                 last_dt = last_dt.replace(tzinfo=timezone.utc)
         except ValueError:
-            return ('Unknown', '—', 'stale_unknown', '#ffffff')
+            return ('Unknown', 'stale_unknown', '#ffffff')
 
         age_days = (datetime.now(timezone.utc) - last_dt).days
 
-        for threshold, label, emoji, tag, colour in _STALENESS_BANDS:
+        for threshold, label, tag, colour in _STALENESS_BANDS:
             if threshold is None or age_days < threshold:
-                return (label, emoji, tag, colour)
+                return (label, tag, colour)
 
-        return ('Dormant', '⬛', 'stale_dormant', '#e2e3e5')
+        return ('Dormant', 'stale_dormant', '#e2e3e5')
 
     def get_staleness_col_str(self, url):
         """Return the formatted string for the 'Last Published' column.
 
-        Format: '<emoji> YYYY-MM-DD'  or  '— Never seen'
+        Format: 'LABEL YYYY-MM-DD'  or  'Never seen'
         """
         if url not in self.data:
-            return '— Never seen'
+            return 'Never seen'
         date_str = self.data[url].get('last_article_date')
         if not date_str:
-            return '— Never seen'
-        _, emoji, _, _ = self.get_staleness_info(url)
-        return f"{emoji} {date_str[:10]}"
+            return 'Never seen'
+        label, _, _ = self.get_staleness_info(url)
+        return f"{label} {date_str[:10]}"
 
     # --- Querying: notes ---
 
@@ -706,11 +704,11 @@ class OSINTApp:
             summary_frame,
             text=(
                 f"  {len(self.health_db.data)} feeds tracked"
-                f"  |  ✔ {counts.get('Good', 0)} Good"
-                f"  ⚠ {counts.get('Unstable', 0)} Unstable"
-                f"  ↓ {counts.get('Poor', 0)} Poor"
-                f"  ✖ {counts.get('Dead', 0)} Dead"
-                f"  ★ {counts.get('New', 0)} New"
+                f"  |  {counts.get('Good', 0)} Good"
+                f"  {counts.get('Unstable', 0)} Unstable"
+                f"  {counts.get('Poor', 0)} Poor"
+                f"  {counts.get('Dead', 0)} Dead"
+                f"  {counts.get('New', 0)} New"
             ),
             font=("Arial", 10),
         ).pack(side=tk.LEFT)
@@ -736,7 +734,7 @@ class OSINTApp:
         toolbar = ttk.Frame(win, padding="8 4")
         toolbar.pack(fill=tk.X)
 
-        ttk.Button(toolbar, text="↻ Refresh",
+        ttk.Button(toolbar, text="Refresh",
                    command=lambda: self._refresh_health_tree(feed_tree)).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="Export to CSV",
                    command=lambda: self._export_health_csv(win)).pack(side=tk.LEFT, padx=4)
@@ -840,7 +838,7 @@ class OSINTApp:
         for url, entry in self.health_db.data.items():
             status       = self.health_db.get_status(url)
             note         = entry.get('note', '')
-            note_display = (note[:35] + '…') if len(note) > 35 else note
+            note_display = (note[:35] + '...') if len(note) > 35 else note
 
             tree.insert('', tk.END, iid=url, values=(
                 status,
@@ -860,7 +858,7 @@ class OSINTApp:
         rows = [(tree.set(child, col), child) for child in tree.get_children('')]
         try:
             rows.sort(
-                key=lambda x: float(x[0]) if x[0] not in ('—', '', '— Never seen') else -1.0,
+                key=lambda x: float(x[0]) if x[0] not in ('—', '', 'Never seen') else -1.0,
                 reverse=reverse,
             )
         except ValueError:
@@ -887,7 +885,7 @@ class OSINTApp:
         self.health_db.save()
 
         # Update the treeview row immediately without a full refresh
-        display = (new_note[:35] + '…') if len(new_note) > 35 else new_note
+        display = (new_note[:35] + '...') if len(new_note) > 35 else new_note
         vals    = list(tree.item(iid, 'values'))
         vals[9] = display   # 'note' is column index 9
         tree.item(iid, values=vals)
@@ -970,7 +968,7 @@ class OSINTApp:
 
         ttk.Label(
             parent,
-            text="Row colours: 🟢 all healthy  🟡 some unstable/poor  🔴 has dead feed(s)",
+            text="Row colours: Green = all healthy  |  Amber = some unstable/poor  |  Red = has dead feed(s)",
             font=("Arial", 8), foreground="gray",
         ).pack(pady=(2, 4))
 
@@ -1074,7 +1072,7 @@ class OSINTApp:
                 )
             return
 
-        title = ("⚠  Dead Feeds Detected After Scan" if auto_prompt
+        title = ("Dead Feeds Detected After Scan" if auto_prompt
                  else "Dead Feed Manager")
 
         win = tk.Toplevel(self.root)
@@ -1575,4 +1573,3 @@ if __name__ == "__main__":
     root = tk.Tk()
     app  = OSINTApp(root)
     root.mainloop()
-    
