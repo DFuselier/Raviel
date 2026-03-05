@@ -129,8 +129,7 @@ def _now_str():
     return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
 
-# Staleness thresholds: (max_days_or_None, label, emoji, tag_name, hex_colour)
-# The emoji prefix is embedded in the 'Last Published' column string so it is
+# Staleness thresholds: (max_days_or_None, label, tag_name, hex_colour)
 # visible without needing per-cell background colours (Treeview does not support
 # per-cell colouring natively).
 _STALENESS_BANDS = [
