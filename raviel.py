@@ -738,9 +738,23 @@ class OSINTApp:
                    command=lambda: self._refresh_health_tree(feed_tree)).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="Export to CSV",
                    command=lambda: self._export_health_csv(win)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="Export Diagnostics",
+                   command=lambda: self._export_diagnostics_report(win)).pack(side=tk.LEFT, padx=4)
+
+        ttk.Separator(toolbar, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=6)
+
+        ttk.Button(
+            toolbar, text="Copy Selected URLs",
+            command=lambda: self._copy_selected_urls(feed_tree, win),
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            toolbar, text="Remove Selected",
+            command=lambda: self._remove_selected_from_dashboard(feed_tree, win),
+        ).pack(side=tk.LEFT, padx=4)
+
         ttk.Label(
             toolbar,
-            text="By Feed: double-click = copy URL  |  right-click = edit note  |  click header = sort",
+            text="Ctrl+click or Shift+click to select multiple rows  |  right-click for options",
             font=("Arial", 8), foreground="gray",
         ).pack(side=tk.LEFT, padx=12)
 
@@ -765,7 +779,7 @@ class OSINTApp:
             show='headings',
             yscrollcommand=scroll_y.set,
             xscrollcommand=scroll_x.set,
-            selectmode='browse',
+            selectmode='extended',
         )
         scroll_y.config(command=tree.yview)
         scroll_x.config(command=tree.xview)
@@ -820,6 +834,9 @@ class OSINTApp:
                             command=lambda: self._open_note_editor(tree, row))
             ctx.add_command(label="Copy URL",
                             command=lambda: self._copy_url_from_row(tree, row, win))
+            ctx.add_separator()
+            ctx.add_command(label="Remove Feed...",
+                            command=lambda: self._remove_feed_from_dashboard(tree, [row], win))
             try:
                 ctx.tk_popup(event.x_root, event.y_root)
             finally:
@@ -896,8 +913,71 @@ class OSINTApp:
         self.root.clipboard_clear()
         self.root.clipboard_append(url_val)
         self.root.update()
-        win.title("Feed Health Dashboard  —  URL copied!")
+        win.title("Feed Health Dashboard  --  URL copied!")
         win.after(1800, lambda: win.title("Feed Health Dashboard"))
+
+    def _remove_feed_from_dashboard(self, tree, iids, win):
+        """Remove one or more feeds from valid_sources.txt and the health DB.
+
+        Args:
+            tree:  The By-Feed treeview.
+            iids:  List of treeview item IDs (== URL strings).
+            win:   The dashboard toplevel window (for dialog parenting).
+        """
+        urls = [tree.item(iid, 'values')[1] for iid in iids]
+        if not urls:
+            return
+
+        preview = "\n".join(f"  {u[:80]}" for u in urls[:6])
+        if len(urls) > 6:
+            preview += f"\n  ... and {len(urls) - 6} more"
+
+        if not messagebox.askyesno(
+            "Confirm Removal",
+            f"Remove {len(urls)} feed(s) from {SOURCE_FILE} and the health database?\n\n{preview}",
+            parent=win,
+        ):
+            return
+
+        removed, not_found = self._remove_urls_from_sources(urls)
+        self.health_db.remove_urls(removed)
+        self.health_db.save()
+
+        # Remove rows from the treeview immediately — no full refresh needed.
+        for iid in iids:
+            url = tree.item(iid, 'values')[1]
+            if url in removed:
+                tree.delete(iid)
+
+        summary = f"Removed {len(removed)} feed(s)."
+        if not_found:
+            summary += f"\n\n{len(not_found)} URL(s) were not in {SOURCE_FILE} (health DB entry still cleared)."
+        messagebox.showinfo("Done", summary, parent=win)
+
+    def _copy_selected_urls(self, tree, win):
+        """Copy the URLs of all currently selected rows to the clipboard, one per line."""
+        selected = tree.selection()
+        if not selected:
+            messagebox.showinfo("Nothing Selected",
+                                "Select one or more rows first (Ctrl+click or Shift+click).",
+                                parent=win)
+            return
+        urls = [tree.item(iid, 'values')[1] for iid in selected]
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(urls))
+        self.root.update()
+        win.title(f"Feed Health Dashboard  --  {len(urls)} URL(s) copied!")
+        win.after(2000, lambda: win.title("Feed Health Dashboard"))
+
+    def _remove_selected_from_dashboard(self, tree, win):
+        """Remove all currently selected rows from valid_sources.txt and the health DB."""
+        selected = tree.selection()
+        if not selected:
+            messagebox.showinfo("Nothing Selected",
+                                "Select one or more rows first (Ctrl+click or Shift+click).",
+                                parent=win)
+            return
+        self._remove_feed_from_dashboard(tree, list(selected), win)
 
     # ------------------------------------------------------------------
     # By-Category tab
@@ -1041,6 +1121,92 @@ class OSINTApp:
                                 parent=parent_win)
         except OSError as e:
             messagebox.showerror("Export Failed", f"Could not write CSV:\n{e}",
+                                 parent=parent_win)
+
+    def _export_diagnostics_report(self, parent_win):
+        """Write a plain-text diagnostics report combining:
+            - Section 1: Feeds with no article date ever recorded ('Never seen')
+            - Section 2: All feeds that have ever produced an error, with full details
+        Intended to be shared for troubleshooting broken or silent feeds.
+        """
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")],
+            title="Save Diagnostics Report",
+            parent=parent_win,
+        )
+        if not file_path:
+            return
+
+        now_str      = datetime.now().strftime('%Y-%m-%d %H:%M')
+        never_seen   = []
+        error_feeds  = []
+
+        for url, entry in self.health_db.data.items():
+            if not entry.get('last_article_date'):
+                never_seen.append((url, entry))
+            if entry.get('last_error_msg'):
+                error_feeds.append((url, entry))
+
+        # Sort both lists by category then URL for readability
+        never_seen.sort(key=lambda x: (x[1].get('category', ''), x[0]))
+        error_feeds.sort(key=lambda x: (-x[1].get('consecutive_failures', 0), x[0]))
+
+        try:
+            with open(file_path, 'w', encoding='utf-8') as fh:
+                fh.write(f"OSINT SCANNER DIAGNOSTICS REPORT\n")
+                fh.write(f"Generated: {now_str}\n")
+                fh.write(f"Total feeds tracked: {len(self.health_db.data)}\n")
+                fh.write("=" * 70 + "\n\n")
+
+                # --- Section 1: Never Seen ---
+                fh.write(f"SECTION 1 — NEVER SEEN ({len(never_seen)} feeds)\n")
+                fh.write("These feeds have never returned a parseable article date.\n")
+                fh.write("Possible causes: feed is empty, date fields are missing, or the\n")
+                fh.write("feed format is non-standard. Check the URL manually.\n")
+                fh.write("-" * 70 + "\n\n")
+
+                if never_seen:
+                    for url, entry in never_seen:
+                        fh.write(f"URL:       {url}\n")
+                        fh.write(f"Category:  {entry.get('category', 'Unknown')}\n")
+                        fh.write(f"Status:    {self.health_db.get_status(url)}\n")
+                        fh.write(f"Scans:     {entry.get('total_scans', 0)} total, "
+                                 f"{entry.get('total_successes', 0)} successful\n")
+                        fh.write(f"First seen:{entry.get('first_seen', 'Unknown')}\n")
+                        if entry.get('last_error_msg'):
+                            fh.write(f"Last error:{entry.get('last_error_msg')}\n")
+                        fh.write("\n")
+                else:
+                    fh.write("None — all tracked feeds have returned at least one article date.\n\n")
+
+                # --- Section 2: Error History ---
+                fh.write("=" * 70 + "\n\n")
+                fh.write(f"SECTION 2 — ERROR HISTORY ({len(error_feeds)} feeds with errors)\n")
+                fh.write("Sorted by consecutive failures (worst first).\n")
+                fh.write("-" * 70 + "\n\n")
+
+                if error_feeds:
+                    for url, entry in error_feeds:
+                        cf = entry.get('consecutive_failures', 0)
+                        fh.write(f"URL:              {url}\n")
+                        fh.write(f"Category:         {entry.get('category', 'Unknown')}\n")
+                        fh.write(f"Status:           {self.health_db.get_status(url)}\n")
+                        fh.write(f"Consec. failures: {cf}\n")
+                        fh.write(f"Success rate:     {self.health_db.get_success_rate_str(url)}\n")
+                        fh.write(f"Last error time:  {entry.get('last_error', 'Unknown')}\n")
+                        fh.write(f"Last error msg:   {entry.get('last_error_msg', 'Unknown')}\n")
+                        fh.write("\n")
+                else:
+                    fh.write("None — no feeds have recorded errors yet.\n\n")
+
+            messagebox.showinfo("Diagnostics Saved",
+                                f"Report saved to:\n{file_path}\n\n"
+                                f"{len(never_seen)} never-seen feed(s)\n"
+                                f"{len(error_feeds)} feed(s) with error history",
+                                parent=parent_win)
+        except OSError as e:
+            messagebox.showerror("Export Failed", f"Could not write report:\n{e}",
                                  parent=parent_win)
 
     # ------------------------------------------------------------------
@@ -1193,7 +1359,7 @@ class OSINTApp:
         """Remove specific URLs from valid_sources.txt.  Returns (removed, not_found)."""
         remove_set = set(urls_to_remove)
         removed    = []
-        not_found  = list(remove_set)
+        not_found  = set(remove_set)   # shrinks as matches are found
         new_lines  = []
         try:
             with open(SOURCE_FILE, 'r', encoding='utf-8') as fh:
@@ -1201,15 +1367,15 @@ class OSINTApp:
                     stripped = line.strip()
                     if stripped in remove_set:
                         removed.append(stripped)
-                        not_found = [u for u in not_found if u != stripped]
+                        not_found.discard(stripped)
                     else:
                         new_lines.append(line)
             with open(SOURCE_FILE, 'w', encoding='utf-8') as fh:
                 fh.writelines(new_lines)
         except OSError as e:
             messagebox.showerror("File Error", f"Could not modify {SOURCE_FILE}:\n{e}")
-            return [], urls_to_remove
-        return removed, not_found
+            return [], list(urls_to_remove)
+        return removed, list(not_found)
 
     # ------------------------------------------------------------------
     # STANDARD GUI METHODS
@@ -1367,9 +1533,13 @@ class OSINTApp:
                     self.lbl_status.config(text=f"Scanning... ({curr}/{total})")
 
                 elif msg_type == "done":
-                    self.lbl_status.config(text="Scan Complete!")
+                    elapsed = datetime.now() - self._scan_start
+                    mins, secs = divmod(int(elapsed.total_seconds()), 60)
+                    elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+                    self.lbl_status.config(text=f"Scan Complete  |  Duration: {elapsed_str}")
                     self.btn_scan.config(state='normal')
                     self.btn_edit.config(state='normal')
+                    self.log_area.see('1.0')
 
                 elif msg_type == "dead_feeds":
                     self.open_dead_feed_manager(auto_prompt=True)
@@ -1385,6 +1555,7 @@ class OSINTApp:
 
     def start_scan_thread(self):
         """Disable buttons, clear the log, and launch the scan in a background thread."""
+        self._scan_start = datetime.now()
         self.btn_scan.config(state='disabled')
         self.btn_edit.config(state='disabled')
 
@@ -1431,6 +1602,7 @@ class OSINTApp:
         processed_count      = 0
         total_findings_count = 0
         seen_links           = set()
+        site_article_counts  = {}   # {site_title: count} for top-source reporting
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {
@@ -1484,6 +1656,11 @@ class OSINTApp:
                         category_findings.setdefault(cat, [])
                         found_data['articles'] = filtered_articles
                         category_findings[cat].append(found_data)
+                        # Accumulate for top-source reporting
+                        title_key = found_data.get('site_title', orig_url)
+                        site_article_counts[title_key] = (
+                            site_article_counts.get(title_key, 0) + len(filtered_articles)
+                        )
 
         self.health_db.save()
 
@@ -1549,20 +1726,21 @@ class OSINTApp:
                 "INFO",
             )
 
+            if site_article_counts:
+                top_site  = max(site_article_counts, key=site_article_counts.get)
+                top_count = site_article_counts[top_site]
+                self.log(f"--- Top Source: {top_site} ({top_count} article(s)) ---", "INFO")
+
         except OSError as e:
             self.log(f"Error writing file: {e}", "ERROR")
 
         self.scan_finished()
 
-        try:
-            if os.path.exists(SOURCE_FILE):
-                with open(SOURCE_FILE, 'r', encoding='utf-8') as fh:
-                    source_text = fh.read()
-                if any(url in source_text
-                       for url in self.health_db.get_dead_feeds(DEAD_FEED_THRESHOLD)):
-                    self.prompt_dead_feeds()
-        except OSError:
-            pass
+        # Check if any dead feeds are still present in the source list we already loaded.
+        scanned_urls = {url for _, url in source_list}
+        if any(url in scanned_urls
+               for url in self.health_db.get_dead_feeds(DEAD_FEED_THRESHOLD)):
+            self.prompt_dead_feeds()
 
 
 # ---------------------------------------------------------------------------
