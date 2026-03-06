@@ -14,6 +14,7 @@ import urllib.parse
 import email.utils
 import gzip
 import re
+import time
 import concurrent.futures
 from datetime import datetime, timedelta, timezone
 
@@ -32,7 +33,9 @@ _DEFAULTS = {
     "max_workers":         10,
     "dead_feed_threshold": 3,
     "high_priority_terms": [
-
+        "Node.js", "Jenkins", "ESXi", "Ivanti", "Tenable", "Shiny",
+        "Coupa", "Workday", "Salesforce", "Deal Cloud", "Hazeltree", "Drupal",
+        "RDP", "RMM", "Remote Management", "Remote Monitoring", "IOC", "Cisco"
     ],
     "tld_map": {
         ".fr": "France", ".in": "India", ".uk": "United Kingdom", ".jp": "Japan",
@@ -129,7 +132,8 @@ def _now_str():
     return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
 
-# Staleness thresholds: (max_days_or_None, label, tag_name, hex_colour)
+# Staleness thresholds: (max_days_or_None, label, emoji, tag_name, hex_colour)
+# The emoji prefix is embedded in the 'Last Published' column string so it is
 # visible without needing per-cell background colours (Treeview does not support
 # per-cell colouring natively).
 _STALENESS_BANDS = [
@@ -428,17 +432,28 @@ def get_country_from_url(url):
 
 
 def parse_date_smart(date_obj_or_str):
-    """Parse a date from various formats into a timezone-aware datetime object."""
+    """Parse a date from various formats into a timezone-aware datetime object.
+
+    Accepts feedparser time tuples, email-format strings, and a wide range of
+    ISO / RFC / locale date strings.  Returns None if the input cannot be parsed.
+    """
     if not date_obj_or_str:
         return None
 
+    # feedparser often gives us a time.struct_time / 9-tuple
     if isinstance(date_obj_or_str, tuple):
         try:
-            return datetime(*date_obj_or_str[:6], tzinfo=timezone.utc)
+            # Guard against zero-valued or out-of-range struct fields
+            year = date_obj_or_str[0]
+            if year and year > 1970:
+                return datetime(*date_obj_or_str[:6], tzinfo=timezone.utc)
         except (ValueError, TypeError):
             pass
 
     date_str = str(date_obj_or_str).strip()
+
+    # Strip common timezone name suffixes that strptime %Z can't always handle
+    date_str_clean = re.sub(r'\s+(GMT|UTC|EST|PST|EDT|PDT|CST|CDT|MST|MDT)$', '', date_str)
 
     try:
         parsed = email.utils.parsedate_to_datetime(date_str)
@@ -447,15 +462,37 @@ def parse_date_smart(date_obj_or_str):
     except (TypeError, ValueError):
         pass
 
-    for fmt in [
-        '%d %b, %Y %z', '%d %b %Y %H:%M:%S %z', '%Y-%m-%d %H:%M:%S',
-        '%a, %d %b %Y %H:%M:%S %Z', '%Y-%m-%dT%H:%M:%S%z', '%Y-%m-%dT%H:%M:%SZ',
-    ]:
-        try:
-            dt = datetime.strptime(date_str, fmt)
-            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
+    manual_formats = [
+        # RFC / email variants
+        '%d %b, %Y %z',
+        '%d %b %Y %H:%M:%S %z',
+        '%a, %d %b %Y %H:%M:%S %Z',
+        '%a %b %d %H:%M:%S %Z %Y',        # Unix ctime: "Thu Mar  6 12:00:00 UTC 2026"
+        # ISO 8601 variants
+        '%Y-%m-%dT%H:%M:%S%z',
+        '%Y-%m-%dT%H:%M:%SZ',
+        '%Y-%m-%dT%H:%M:%S.%f%z',          # microseconds with offset
+        '%Y-%m-%dT%H:%M:%S.%fZ',           # microseconds, Z suffix
+        '%Y-%m-%dT%H:%M:%S',               # no timezone
+        '%Y-%m-%d %H:%M:%S',
+        '%Y-%m-%d %H:%M:%S%z',
+        '%Y-%m-%d',                         # date-only (NIST, some gov feeds)
+        # Locale-style
+        '%d %B %Y',                         # "06 March 2026"
+        '%B %d, %Y',                        # "March 06, 2026"
+        '%d-%b-%Y',                         # "06-Mar-2026"
+        # Asian feed formats
+        '%Y/%m/%d %H:%M:%S',
+        '%Y/%m/%d',
+    ]
+
+    for fmt in manual_formats:
+        for s in (date_str, date_str_clean):
+            try:
+                dt = datetime.strptime(s, fmt)
+                return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
 
     return None
 
@@ -481,37 +518,86 @@ def check_for_iocs(text):
     return False
 
 
+def _build_ssl_context(verify=True):
+    """Return an SSL context.  When verify=False, disables cert checking."""
+    ctx = ssl.create_default_context()
+    if not verify:
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
+    return ctx
+
+
 def fetch_feed_content(url):
     """Fetch raw feed bytes from a URL.
 
-    Returns bytes on success, or b"ERROR: ..." for 403.
-    Raises for all other errors.
+    Resilience strategy (in order):
+      1. Normal request with full SSL verification.
+      2. On SSL certificate error  → retry once with verification disabled.
+      3. On HTTP 429              → retry up to 2x with exponential back-off (1s, 2s).
+      4. On HTTP 521/522/524      → retry once after 1 s (Cloudflare transient errors).
+      5. On socket timeout         → retry once immediately.
+      6. HTTP 403                 → return b"ERROR: 403 Forbidden" (not an exception).
+      7. Any other error          → raise so the caller records a failure.
     """
-    ssl_context = ssl.create_default_context()
     headers = {'User-Agent': SEC_USER_AGENT} if "sec.gov" in url else STANDARD_HEADERS
-    req = urllib.request.Request(url, headers=headers)
 
-    try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS, context=ssl_context) as response:
-            content = response.read()
+    def _do_request(verify_ssl=True, attempt=0):
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(
+                req,
+                timeout=TIMEOUT_SECONDS,
+                context=_build_ssl_context(verify_ssl),
+            ) as response:
+                content = response.read()
 
-            if response.info().get('Content-Encoding') == 'gzip':
+                if response.info().get('Content-Encoding') == 'gzip':
+                    try:
+                        content = gzip.decompress(content)
+                    except gzip.BadGzipFile:
+                        pass
+                    except OSError as e:
+                        raise RuntimeError(f"Gzip decompression failed: {e}") from e
+
                 try:
-                    content = gzip.decompress(content)
-                except gzip.BadGzipFile:
-                    pass
-                except OSError as e:
-                    raise RuntimeError(f"Gzip decompression failed: {e}") from e
+                    return content.decode('utf-8-sig').strip().encode('utf-8')
+                except UnicodeDecodeError:
+                    return content.decode('iso-8859-1').encode('utf-8')
 
-            try:
-                return content.decode('utf-8-sig').strip().encode('utf-8')
-            except UnicodeDecodeError:
-                return content.decode('iso-8859-1').encode('utf-8')
+        except urllib.error.HTTPError as e:
+            if e.code == 403:
+                return b"ERROR: 403 Forbidden"
 
-    except urllib.error.HTTPError as e:
-        if e.code == 403:
-            return b"ERROR: 403 Forbidden"
-        raise
+            # Rate-limited: back off and retry up to twice
+            if e.code == 429 and attempt < 2:
+                time.sleep(2 ** attempt)        # 1 s, then 2 s
+                return _do_request(verify_ssl=verify_ssl, attempt=attempt + 1)
+
+            # Cloudflare origin-unreachable: one quick retry
+            if e.code in (521, 522, 524) and attempt == 0:
+                time.sleep(1)
+                return _do_request(verify_ssl=verify_ssl, attempt=1)
+
+            raise
+
+        except urllib.error.URLError as e:
+            reason = str(getattr(e, 'reason', e))
+
+            # SSL certificate problem: retry without verification
+            if verify_ssl and ('CERTIFICATE_VERIFY_FAILED' in reason or
+                               'certificate verify failed' in reason or
+                               'SSL' in reason):
+                return _do_request(verify_ssl=False, attempt=attempt)
+
+            raise
+
+        except (TimeoutError, socket.timeout, OSError):
+            # One retry on transient socket/timeout failures
+            if attempt == 0:
+                return _do_request(verify_ssl=verify_ssl, attempt=1)
+            raise
+
+    return _do_request()
 
 
 def process_single_feed(source_data, cutoff):
@@ -542,14 +628,27 @@ def process_single_feed(source_data, cutoff):
         for entry in feed.entries:
             pub_date = None
 
-            if hasattr(entry, 'published_parsed'):
-                pub_date = parse_date_smart(entry.published_parsed)
-            elif hasattr(entry, 'updated_parsed'):
-                pub_date = parse_date_smart(entry.updated_parsed)
+            # feedparser parsed fields (time tuples) — try first
+            for attr in ('published_parsed', 'updated_parsed', 'created_parsed'):
+                val = getattr(entry, attr, None)
+                if val:
+                    pub_date = parse_date_smart(val)
+                    if pub_date:
+                        break
 
+            # Raw string fields — feedparser may expose date as string even when
+            # it can't fully parse the tuple (common in non-English / gov feeds)
             if not pub_date:
-                for cand in [entry.get('updated'), entry.get('pubDate'), entry.get('date')]:
-                    if cand:
+                for cand in [
+                    entry.get('published'),
+                    entry.get('updated'),
+                    entry.get('pubDate'),
+                    entry.get('date'),
+                    entry.get('created'),
+                    entry.get('dc_date'),           # Dublin Core date
+                    entry.get('dcterms_modified'),  # Dublin Core modified
+                ]:
+                    if cand and isinstance(cand, str):
                         pub_date = parse_date_smart(cand)
                         if pub_date:
                             break
