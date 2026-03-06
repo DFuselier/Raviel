@@ -33,9 +33,7 @@ _DEFAULTS = {
     "max_workers":         10,
     "dead_feed_threshold": 3,
     "high_priority_terms": [
-        "Node.js", "Jenkins", "ESXi", "Ivanti", "Tenable", "Shiny",
-        "Coupa", "Workday", "Salesforce", "Deal Cloud", "Hazeltree", "Drupal",
-        "RDP", "RMM", "Remote Management", "Remote Monitoring", "IOC", "Cisco"
+
     ],
     "tld_map": {
         ".fr": "France", ".in": "India", ".uk": "United Kingdom", ".jp": "Japan",
@@ -132,8 +130,7 @@ def _now_str():
     return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
 
-# Staleness thresholds: (max_days_or_None, label, emoji, tag_name, hex_colour)
-# The emoji prefix is embedded in the 'Last Published' column string so it is
+# Staleness thresholds: (max_days_or_None, label, tag_name, hex_colour)
 # visible without needing per-cell background colours (Treeview does not support
 # per-cell colouring natively).
 _STALENESS_BANDS = [
